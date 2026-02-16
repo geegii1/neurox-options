@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+import traceback
+import subprocess
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+STATE_DIR = os.path.join(ROOT, "state")
+
+LOCK_PATH = os.path.join(STATE_DIR, "tick.lock")
+STATE_TICK = os.path.join(STATE_DIR, "tick_state.json")
+
+STATE_RISK_MODE = os.path.join(STATE_DIR, "risk_mode.json")
+STATE_GATE_OUT = os.path.join(STATE_DIR, "gate_out.json")
+
+OPEN_INTENT = os.path.join(STATE_DIR, "open_intent.json")
+CLOSE_INTENT = os.path.join(STATE_DIR, "close_intent.json")
+
+
+# -------------------------
+# Small utilities (no deps)
+# -------------------------
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def now_epoch() -> float:
+    return time.time()
+
+
+def ensure_state_dir() -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+
+def atomic_write(path: str, obj: Any) -> None:
+    ensure_state_dir()
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=False)
+    os.replace(tmp, path)
+
+
+def read_json(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def tail_text(s: str, max_chars: int = 2000) -> str:
+    if not s:
+        return ""
+    s = s.strip("\n")
+    return s[-max_chars:]
+
+
+# -------------------------
+# Locking (simple + safe)
+# -------------------------
+def acquire_lock(path: str) -> bool:
+    ensure_state_dir()
+    try:
+        # Create exclusively; fails if exists
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": utc_iso(), "pid": os.getpid()}) + "\n")
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_lock(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+# -------------------------
+# Module runner
+# -------------------------
+def run_module(module: str) -> Dict[str, Any]:
+    """
+    Runs: python -m <module>
+    Captures stdout/stderr. Does NOT print module output (keeps launchd logs clean).
+    """
+    t0 = now_epoch()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", module],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        out = {
+            "returncode": proc.returncode,
+            "stdout_tail": tail_text(proc.stdout),
+            "stderr_tail": tail_text(proc.stderr),
+            "elapsed_ms": int((now_epoch() - t0) * 1000),
+        }
+        return out
+    except Exception as e:
+        return {
+            "returncode": 99,
+            "stdout_tail": "",
+            "stderr_tail": f"EXCEPTION: {type(e).__name__}: {e}\n{traceback.format_exc()}",
+            "elapsed_ms": int((now_epoch() - t0) * 1000),
+        }
+
+
+def step_run(name: str, fn, critical: bool = True) -> Dict[str, Any]:
+    t0 = now_epoch()
+    res = fn()
+    ok = (res.get("returncode", 1) == 0)
+    step = {
+        "name": name,
+        "ok": ok,
+        "critical": critical,
+        "elapsed_ms": int((now_epoch() - t0) * 1000),
+        "result": "OK" if ok else "ERR",
+        **res,
+    }
+    return step
+
+
+# -------------------------
+# Calls (modules)
+# -------------------------
+def call_portfolio_greeks():
+    return run_module("services.portfolio.greeks")
+
+
+def call_portfolio_risk():
+    return run_module("services.risk_governor.portfolio_risk")
+
+
+def call_derisk_plan():
+    return run_module("services.risk_governor.derisk_plan")
+
+
+def call_derisk_execute():
+    return run_module("services.risk_governor.derisk_execute")
+
+
+def call_gateway():
+    return run_module("services.pretrade_gateway.gateway")
+
+
+def call_oms_open():
+    return run_module("services.execution.oms_open")
+
+
+def call_oms_open_exec():
+    return run_module("services.execution.oms_open_exec")
+
+
+def call_oms_close():
+    return run_module("services.execution.oms_close")
+
+
+# -------------------------
+# Summary
+# -------------------------
+def summarize_state() -> Dict[str, Any]:
+    risk_mode = read_json(STATE_RISK_MODE) or {"mode": "UNKNOWN", "reason": "missing risk_mode.json"}
+    gate_out = read_json(STATE_GATE_OUT)
+    return {
+        "risk_mode": risk_mode,
+        "open_intent_present": os.path.exists(OPEN_INTENT),
+        "close_intent_present": os.path.exists(CLOSE_INTENT),
+        "gate_out_present": gate_out is not None,
+        "gate_out": gate_out,
+    }
+
+
+# -------------------------
+# Main tick
+# -------------------------
+def main() -> None:
+    ensure_state_dir()
+
+    if not acquire_lock(LOCK_PATH):
+        atomic_write(
+            STATE_TICK,
+            {
+                "ts": utc_iso(),
+                "ok": False,
+                "state": "LOCKED",
+                "reason": "ANOTHER_TICK_RUNNING",
+            },
+        )
+        print(f"Wrote {STATE_TICK}")
+        return
+
+    t0 = now_epoch()
+    steps = []
+    ok = True
+    halted_by = None
+
+    try:
+        # 1) Greeks
+        steps.append(step_run("portfolio.greeks", call_portfolio_greeks, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "portfolio.greeks"
+            raise RuntimeError("tick halted")
+
+        # 2) Portfolio risk -> sets risk_mode
+        steps.append(step_run("risk_governor.portfolio_risk", call_portfolio_risk, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "risk_governor.portfolio_risk"
+            raise RuntimeError("tick halted")
+
+        # 3) Derisk plan
+        steps.append(step_run("risk_governor.derisk_plan", call_derisk_plan, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "risk_governor.derisk_plan"
+            raise RuntimeError("tick halted")
+
+        # 4) Derisk execute (writes/deletes close_intent)
+        steps.append(step_run("risk_governor.derisk_execute", call_derisk_execute, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "risk_governor.derisk_execute"
+            raise RuntimeError("tick halted")
+
+        # 5) Gateway validation (treat as critical for safety)
+        steps.append(step_run("pretrade_gateway.gateway", call_gateway, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "pretrade_gateway.gateway"
+            raise RuntimeError("tick halted")
+
+        # 6) OMS open intent (writes open_intent if candidate allowed)
+        steps.append(step_run("execution.oms_open", call_oms_open, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "execution.oms_open"
+            raise RuntimeError("tick halted")
+
+        # 7) OMS open exec (consumes open_intent; PLAN_ONLY noop for now)
+        steps.append(step_run("execution.oms_open_exec", call_oms_open_exec, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "execution.oms_open_exec"
+            raise RuntimeError("tick halted")
+
+        # 8) OMS close consumes close_intent if present
+        steps.append(step_run("execution.oms_close", call_oms_close, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "execution.oms_close"
+            raise RuntimeError("tick halted")
+
+    except Exception:
+        # step_run captured stderr/stdout; just stop safely
+        pass
+    finally:
+        out = {
+            "ts": utc_iso(),
+            "ok": ok,
+            "halted_by": halted_by,
+            "elapsed_ms": int((now_epoch() - t0) * 1000),
+            "steps": steps,
+            "summary": summarize_state(),
+        }
+        atomic_write(STATE_TICK, out)
+        release_lock(LOCK_PATH)
+        print(f"Wrote {STATE_TICK}")
+
+
+if __name__ == "__main__":
+    main()

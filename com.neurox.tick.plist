@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.neurox.tick</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/zsh</string>
+      <string>/Users/gerelt-oduranchimeg/neurox-options/scripts/tick_loop.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/gerelt-oduranchimeg/neurox-options</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>TICK_SLEEP_SEC</key>
+      <string>2</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/gerelt-oduranchimeg/neurox-options/state/launchd_tick.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/gerelt-oduranchimeg/neurox-options/state/launchd_tick.err.log</string>
+  </dict>
+</plist>

@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# virtual envs
+.venv/
+venv/
+
+# env/secrets
+.env
+.env.*
+
+# runtime/state/logs
+state/*.json
+state/*.jsonl
+state/*.log
+logs/
+*.log
+
+# editor
+.vscode/
+.idea/

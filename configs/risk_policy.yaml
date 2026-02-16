@@ -1,0 +1,12 @@
+account:
+  equity_usd: 1000000
+
+position_limits:
+  per_trade:
+    max_defined_risk_pct_equity: 0.0075     # 0.75% max loss per trade
+    max_contracts_per_order: 50
+
+scenario_limits:
+  incremental_trade:
+    max_incremental_loss_gap_10pct: 0.006   # 0.6% equity worst-case gap per new trade
+    max_incremental_loss_combo_7pct_iv10: 0.005

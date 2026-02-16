@@ -1,0 +1,243 @@
+# services/tick.py
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import traceback
+from datetime import datetime, timezone
+from typing import Any, Dict
+
+LOCK_PATH = "state/tick.lock"
+STATE_TICK = "state/tick_state.json"
+
+
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def now_epoch() -> float:
+    import time
+    return time.time()
+
+
+def atomic_write(path: str, obj: Any) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, sort_keys=False)
+    os.replace(tmp, path)
+
+
+def acquire_lock(path: str) -> bool:
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_lock(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def run_module(module: str) -> Dict[str, Any]:
+    """
+    Runs: python -m <module>
+    Captures tail of stdout/stderr to avoid huge logs.
+    """
+    t0 = now_epoch()
+    try:
+        p = subprocess.run(
+            [os.environ.get("PYTHON", "python"), "-m", module],
+            capture_output=True,
+            text=True,
+        )
+        stdout = (p.stdout or "")[-2000:]
+        stderr = (p.stderr or "")[-2000:]
+        return {
+            "ok": p.returncode == 0,
+            "returncode": p.returncode,
+            "stdout_tail": stdout,
+            "stderr_tail": stderr,
+            "elapsed_ms": int((now_epoch() - t0) * 1000),
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout_tail": "",
+            "stderr_tail": traceback.format_exc()[-2000:],
+            "elapsed_ms": int((now_epoch() - t0) * 1000),
+        }
+
+
+def step_run(name: str, fn, critical: bool) -> Dict[str, Any]:
+    try:
+        r = fn()
+        return {
+            "name": name,
+            "ok": bool(r.get("ok", False)),
+            "critical": critical,
+            "elapsed_ms": int(r.get("elapsed_ms", 0)),
+            "result": "OK" if r.get("ok") else "FAIL",
+            "returncode": r.get("returncode"),
+            "stdout_tail": r.get("stdout_tail", ""),
+            "stderr_tail": r.get("stderr_tail", ""),
+        }
+    except Exception:
+        return {
+            "name": name,
+            "ok": False,
+            "critical": critical,
+            "elapsed_ms": 0,
+            "result": "EXC",
+            "returncode": -1,
+            "stdout_tail": "",
+            "stderr_tail": traceback.format_exc()[-2000:],
+        }
+
+
+def call_portfolio_greeks() -> Dict[str, Any]:
+    return run_module("services.portfolio.greeks")
+
+
+def call_portfolio_risk() -> Dict[str, Any]:
+    return run_module("services.risk_governor.portfolio_risk")
+
+
+def call_derisk_plan() -> Dict[str, Any]:
+    return run_module("services.risk_governor.derisk_plan")
+
+
+def call_derisk_execute() -> Dict[str, Any]:
+    return run_module("services.risk_governor.derisk_execute")
+
+
+def call_gateway() -> Dict[str, Any]:
+    return run_module("services.pretrade_gateway.gateway")
+
+
+def call_oms_open() -> Dict[str, Any]:
+    return run_module("services.execution.oms_open")
+
+
+def call_oms_close() -> Dict[str, Any]:
+    return run_module("services.execution.oms_close")
+
+
+def summarize_state() -> Dict[str, Any]:
+    # Lightweight summary only (don’t break tick if files missing)
+    summary: Dict[str, Any] = {}
+    try:
+        with open("state/risk_mode.json", "r") as f:
+            summary["risk_mode"] = json.load(f)
+    except Exception:
+        summary["risk_mode"] = None
+    try:
+        summary["close_intent_present"] = os.path.exists("state/close_intent.json")
+    except Exception:
+        summary["close_intent_present"] = None
+    try:
+        summary["gate_out_present"] = os.path.exists("state/gate_out.json")
+    except Exception:
+        summary["gate_out_present"] = None
+    try:
+        summary["open_plan_present"] = os.path.exists("state/open_plan.json")
+    except Exception:
+        summary["open_plan_present"] = None
+    return summary
+
+
+def main():
+    if not acquire_lock(LOCK_PATH):
+        atomic_write(
+            STATE_TICK,
+            {
+                "ts": utc_iso(),
+                "ok": False,
+                "state": "LOCKED",
+                "reason": "ANOTHER_TICK_RUNNING",
+            },
+        )
+        print(f"Wrote {STATE_TICK}")
+        return
+
+    t0 = now_epoch()
+    steps = []
+    ok = True
+    halted_by = None
+
+    try:
+        # 1) Greeks
+        steps.append(step_run("portfolio.greeks", call_portfolio_greeks, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "portfolio.greeks"
+            raise RuntimeError("tick halted")
+
+        # 2) Portfolio risk -> sets risk_mode
+        steps.append(step_run("risk_governor.portfolio_risk", call_portfolio_risk, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "portfolio_risk"
+            raise RuntimeError("tick halted")
+
+        # 3) Derisk plan
+        steps.append(step_run("risk_governor.derisk_plan", call_derisk_plan, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "derisk_plan"
+            raise RuntimeError("tick halted")
+
+        # 4) Derisk execute (writes/deletes close_intent)
+        steps.append(step_run("risk_governor.derisk_execute", call_derisk_execute, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "derisk_execute"
+            raise RuntimeError("tick halted")
+
+        # 5) Gateway validation
+        steps.append(step_run("pretrade_gateway.gateway", call_gateway, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "gateway"
+            raise RuntimeError("tick halted")
+
+        # 6) OMS open (PLAN_ONLY) — blocked unless risk_mode == NORMAL
+        steps.append(step_run("execution.oms_open", call_oms_open, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "oms_open"
+            raise RuntimeError("tick halted")
+
+        # 7) OMS close consumes close_intent if present
+        steps.append(step_run("execution.oms_close", call_oms_close, critical=True))
+        if not steps[-1]["ok"]:
+            ok = False
+            halted_by = "oms_close"
+            raise RuntimeError("tick halted")
+
+    except Exception:
+        pass
+    finally:
+        summary = summarize_state()
+        out = {
+            "ts": utc_iso(),
+            "ok": ok,
+            "halted_by": halted_by,
+            "elapsed_ms": int((now_epoch() - t0) * 1000),
+            "steps": steps,
+            "summary": summary,
+        }
+        atomic_write(STATE_TICK, out)
+        release_lock(LOCK_PATH)
+        print(f"Wrote {STATE_TICK}")
+
+
+if __name__ == "__main__":
+    main()
